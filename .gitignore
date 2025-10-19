@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+.Rhistory
+.Rproj.user/
+.DS_Store
+.idea/
+.vscode/*.log
+*.Rproj
+*.sqlite
+*.db
