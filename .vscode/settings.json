@@ -1,5 +1,5 @@
 {
-  "r.rterm.windows": "C:\\Program Files\\R\\R-4.5.1\\bin\\R.exe",
-  "r.alwaysUseActiveTerminal": true,
-  "r.bracketedPaste": true
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.envFile": "${workspaceFolder}/.env"
 }
+

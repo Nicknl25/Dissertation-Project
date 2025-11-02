@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup .venv and required packages",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "powershell.exe",
+          "args": [
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command"
+          ]
+        }
+      },
+      "command": "$ErrorActionPreference = 'Stop'; if (-not (Test-Path '.venv/Scripts/python.exe')) { Write-Host 'Creating .venv...'; if (Get-Command python -ErrorAction SilentlyContinue) { python -m venv .venv } elseif (Get-Command py -ErrorAction SilentlyContinue) { py -3 -m venv .venv } else { Write-Error 'Python not found on PATH. Install Python 3.x and retry.'; exit 1 } }; $venvPy = Join-Path (Resolve-Path '.venv') 'Scripts/python.exe'; & $venvPy -m pip install --upgrade pip setuptools wheel; & $venvPy -m pip install flask python-dotenv openai pandas pdfplumber PyPDF2 xlwings",
+      "problemMatcher": []
+    }
+  ]
+}
+

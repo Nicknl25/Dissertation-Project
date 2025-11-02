@@ -1,0 +1,110 @@
+#!/usr/bin/env Rscript
+# ======================================================
+#  load_fred_macro_data.R
+#  Purpose: Pull key FRED macro indicators (env-driven)
+#  Database: financials
+# ======================================================
+
+# ---- Libraries ----
+suppressPackageStartupMessages({
+  library(fredr)
+  library(dplyr)
+  library(lubridate)
+  library(DBI)
+  library(RMariaDB)
+  library(dotenv)
+  library(zoo)
+})
+
+# ---- Load environment variables ----
+if (file.exists(".env")) {
+  dotenv::load_dot_env(file = ".env")
+} else if (file.exists("../.env")) {
+  dotenv::load_dot_env(file = "../.env")
+}
+
+fredr_set_key(Sys.getenv("FRED_API_KEY"))
+
+# ---- MySQL Connection ----
+con <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "financials",
+  host     = Sys.getenv("MYSQL_HOST"),
+  port     = as.numeric(Sys.getenv("MYSQL_PORT", 3306)),
+  user     = Sys.getenv("MYSQL_USER"),
+  password = Sys.getenv("MYSQL_PASSWORD")
+)
+
+# ---- Helper: Convert monthly → quarterly ----
+monthly_to_quarterly <- function(df) {
+  df %>%
+    dplyr::mutate(year_qtr = paste0(lubridate::year(date), "Q", lubridate::quarter(date))) %>%
+    dplyr::group_by(series_id, year_qtr) %>%
+    dplyr::summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(date = as.Date(as.yearqtr(year_qtr), frac = 1)) %>%
+    dplyr::select(series_id, date, value, year_qtr)
+}
+
+# ---- Date Range from Environment ----
+start_date_raw <- Sys.getenv("START_DATE", "2024-01-01")
+end_date_raw   <- Sys.getenv("END_DATE", Sys.Date())
+
+start_date <- as.Date(start_date_raw)
+end_date   <- as.Date(end_date_raw)
+
+message("📅 Using date range from .env: ", start_date, " → ", end_date)
+
+# ---- Pull and Process FRED Series ----
+message("📊 Pulling GDP ...")
+gdp <- fredr(series_id = "GDP",
+             observation_start = start_date,
+             observation_end   = end_date,
+             frequency = "q") %>%
+  dplyr::select(series_id, date, value) %>%
+  dplyr::mutate(year_qtr = paste0(year(date), "Q", quarter(date)))
+
+message("📊 Pulling CPI (monthly → quarterly) ...")
+cpi <- fredr(series_id = "CPIAUCSL",
+             observation_start = start_date,
+             observation_end   = end_date) %>%
+  monthly_to_quarterly()
+
+message("📊 Pulling UNRATE (monthly → quarterly) ...")
+unrate <- fredr(series_id = "UNRATE",
+                observation_start = start_date,
+                observation_end   = end_date) %>%
+  monthly_to_quarterly()
+
+message("📊 Pulling FEDFUNDS (monthly → quarterly) ...")
+fedfunds <- fredr(series_id = "FEDFUNDS",
+                  observation_start = start_date,
+                  observation_end   = end_date) %>%
+  monthly_to_quarterly()
+
+# ---- Combine and Inspect ----
+macro_data <- dplyr::bind_rows(gdp, cpi, unrate, fedfunds) %>%
+  dplyr::arrange(series_id, date)
+
+cat("\n✅ Preview of combined macro data:\n")
+print(macro_data)
+
+# ---- Insert into MySQL (Safe Loop Method) ----
+message("\n💾 Writing to MySQL (row-by-row, safe insert)...")
+for (i in seq_len(nrow(macro_data))) {
+  query <- sprintf(
+    "INSERT INTO fred_macro_data (series_id, date, value, year_qtr)
+     VALUES ('%s', '%s', %f, '%s')
+     ON DUPLICATE KEY UPDATE value = VALUES(value), year_qtr = VALUES(year_qtr);",
+    macro_data$series_id[i],
+    macro_data$date[i],
+    macro_data$value[i],
+    macro_data$year_qtr[i]
+  )
+  dbExecute(con, query)
+}
+
+message("\n✅ Macro data successfully written to financials.fred_macro_data")
+
+# ---- Close Connection ----
+dbDisconnect(con)
+message("\n✅ Process complete. MySQL connection closed.\n")

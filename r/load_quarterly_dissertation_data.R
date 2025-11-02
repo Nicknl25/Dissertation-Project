@@ -32,18 +32,29 @@ suppressPackageStartupMessages({
 # -----------------------------------------------------------------------------
 # Configurable parameters (easy to change later or source from Excel)
 # -----------------------------------------------------------------------------
-lookback_years <- 10
-symbols <- c("AAPL", "MSFT", "AMZN", "GOOGL")
+# Date range and symbols are now provided at runtime:
+# - Dates via START_DATE / END_DATE env vars (set after load_dot_env() in Main)
+# - Symbols loaded dynamically from the database (in Main)
 
 # -----------------------------------------------------------------------------
 # Environment and helpers
 # -----------------------------------------------------------------------------
 load_dot_env <- function() {
-  tryCatch({
+  loaded <- FALSE
+  try({
     dotenv::load_dot_env(file = ".env")
-  }, error = function(e) {
-    message("Warning: .env not loaded: ", conditionMessage(e))
-  })
+    loaded <- TRUE
+  }, silent = TRUE)
+  if (!loaded) {
+    # Fallback: if working dir is the script's subfolder (e.g., r/), try parent
+    parent_env <- file.path("..", ".env")
+    if (file.exists(parent_env)) {
+      try(dotenv::load_dot_env(file = parent_env, override = FALSE), silent = TRUE)
+      loaded <- TRUE
+    } else {
+      message("Warning: .env not found in working directory; also tried ../.env")
+    }
+  }
 }
 
 get_env <- function(key) {
@@ -53,19 +64,31 @@ get_env <- function(key) {
   val
 }
 
+# -----------------------------------------------------------------------------
+# Resource cleanup helper (prevents file-handle leaks in long runs)
+# -----------------------------------------------------------------------------
+cleanup_resources <- function() {
+  try(closeAllConnections(), silent = TRUE)
+  try(gc(), silent = TRUE)
+  invisible(TRUE)
+}
+
+maybe_cleanup <- function(i, every = 25) {
+  if (is.na(every) || every <= 1L || (i %% every) == 0L) {
+    cleanup_resources()
+  }
+}
+
 alpha_key <- NULL
 last_request_time <- NULL
 polite_get <- function(req) {
-  # Alpha Vantage free tier: 5 requests/minute
-  now <- Sys.time()
-  if (!is.null(last_request_time)) {
-    delta <- as.numeric(difftime(now, last_request_time, units = "secs"))
-    if (delta < 13) {
-      Sys.sleep(13 - delta)
-    }
-  }
+  # Fast path for paid plans; retry once on transient errors (429/5xx)
   resp <- req_perform(req)
-  last_request_time <<- Sys.time()
+  status <- try(resp_status(resp), silent = TRUE)
+  if (!inherits(status, "try-error") && is.numeric(status) && status %in% c(429, 500, 502, 503, 504)) {
+    Sys.sleep(1)
+    resp <- req_perform(req)
+  }
   resp
 }
 
@@ -78,6 +101,7 @@ get_alpha <- function(function_name, symbol) {
 
   resp <- polite_get(req)
   json <- resp_body_json(resp, simplifyVector = TRUE)
+  try(httr2::resp_close(resp), silent = TRUE)
 
   # If rate-limited or error, Alpha Vantage returns a "Note" or "Information" field
   note_text <- NULL
@@ -149,6 +173,7 @@ get_share_price_on_date <- function(symbol, date) {
       req_timeout(60)
     resp <- polite_get(req)
     js <- resp_body_json(resp, simplifyVector = TRUE)
+    try(httr2::resp_close(resp), silent = TRUE)
     ts <- js[["Time Series (Daily)"]]
     if (is.null(ts)) {
       return(NA_real_)
@@ -160,6 +185,11 @@ get_share_price_on_date <- function(symbol, date) {
       adj = suppressWarnings(as.numeric(vapply(ts, function(x) x[["5. adjusted close"]], FUN.VALUE = character(1))))
     ) |>
       arrange(d)
+    # Respect global end_date if available (avoid using future/out-of-range prices)
+    if (exists("end_date", inherits = TRUE) && !is.null(end_date) && !is.na(end_date)) {
+      df <- df |>
+        dplyr::filter(d <= as.Date(end_date))
+    }
     assign(symbol, df, envir = price_cache)
   } else {
     df <- get(symbol, envir = price_cache, inherits = FALSE)
@@ -188,6 +218,7 @@ get_earnings_calendar <- function(symbol) {
       req_timeout(60)
     resp <- polite_get(req)
     txt <- resp_body_string(resp)
+    try(httr2::resp_close(resp), silent = TRUE)
     # Try JSON first
     cal_df <- NULL
     try({
@@ -325,7 +356,7 @@ make_symbol_frame <- function(sym) {
       symbol = sym,
       pull_date = Sys.Date()
     ) |>
-    filter(is.na(fiscalDateEnding) | fiscalDateEnding >= Sys.Date() - years(lookback_years))
+    filter(is.na(fiscalDateEnding) | (fiscalDateEnding >= start_date & fiscalDateEnding <= end_date))
 
   joined
 }
@@ -334,6 +365,26 @@ make_symbol_frame <- function(sym) {
 # Main
 # -----------------------------------------------------------------------------
 load_dot_env()
+
+# Fixed date range from environment (robust parsing)
+parse_date_env <- function(key) {
+  val <- get_env(key)
+  if (is.null(val) || identical(val, "")) return(NA_Date_)
+  suppressWarnings(as.Date(val))
+}
+start_date <- parse_date_env("START_DATE")
+end_date   <- parse_date_env("END_DATE")
+if (is.na(start_date) || is.na(end_date)) {
+  stop(sprintf(
+    "START_DATE or END_DATE missing/invalid in environment (.env). Working dir: %s", getwd()
+  ))
+}
+
+# Echo the configured date range once at start
+message(sprintf(
+  "Run date range: %s to %s",
+  as.character(as.Date(start_date)), as.character(as.Date(end_date))
+))
 
 alpha_key <- get_env("ALPHAVANTAGE_API_KEY")
 if (is.null(alpha_key)) {
@@ -352,172 +403,610 @@ if (is.null(mysql_password)) missing <- c(missing, "MYSQL_PASSWORD")
 if (is.null(mysql_db)) missing <- c(missing, "MYSQL_DB")
 if (length(missing)) stop("Missing DB env vars: ", paste(missing, collapse = ", "))
 
-message(sprintf("Processing %d symbols: %s", length(symbols), paste(symbols, collapse = ", ")))
-
-# Build data for each symbol with progress
-all_frames <- list()
-for (sym in symbols) {
-  message(sprintf("Fetching data for %s ...", sym))
-  all_frames[[sym]] <- make_symbol_frame(sym)
+# Open DB connection early to fetch symbols dynamically
+# Ensure we only use RMariaDB (avoid conflicts if RMySQL is attached)
+if ("package:RMySQL" %in% search()) {
+  try(detach("package:RMySQL", unload = TRUE, character.only = TRUE), silent = TRUE)
 }
 
-master <- bind_rows(all_frames)
+# Anchor the RMariaDB driver object to avoid weak_ptr lifecycle issues
+maria_drv <- RMariaDB::MariaDB()
+con <- DBI::dbConnect(
+  maria_drv,
+  host = mysql_host,
+  user = mysql_user,
+  password = mysql_password,
+  dbname = mysql_db
+)
+on.exit({ try(DBI::dbDisconnect(con), silent = TRUE) }, add = TRUE)
+
+# Helper to ensure DB connection remains valid across long runs/cleanup
+ensure_db_valid <- function() {
+  ok <- TRUE
+  try({ ok <- DBI::dbIsValid(con) }, silent = TRUE)
+  if (!isTRUE(ok)) {
+    try(DBI::dbDisconnect(con), silent = TRUE)
+    con <<- DBI::dbConnect(
+      maria_drv,
+      host = mysql_host,
+      user = mysql_user,
+      password = mysql_password,
+      dbname = mysql_db
+    )
+  }
+  invisible(TRUE)
+}
+
+# API pacing from env (seconds between symbols)
+api_sleep <- as.numeric(get_env("API_SLEEP_SECONDS") %||% 2)
+if (is.na(api_sleep) || api_sleep < 0) api_sleep <- 2
+orig_api_sleep <- api_sleep
+api_sleep <- min(api_sleep, 15)
+if (!is.na(orig_api_sleep) && orig_api_sleep > 15) {
+  message("⚠️ API_SLEEP_SECONDS capped at 15 seconds (value too high)")
+}
+message(sprintf("API pacing: %s seconds between symbols", api_sleep))
+
+# Test mode and ticker limit from env
+test_mode <- tolower((get_env("TEST_MODE") %||% "false"))
+test_mode <- test_mode %in% c("1", "true", "t", "yes", "y")
+ticker_limit <- suppressWarnings(as.integer(get_env("TICKER_LIMIT") %||% "10"))
+if (is.na(ticker_limit) || ticker_limit <= 0) ticker_limit <- 10
+
+# Build ticker query based on TEST_MODE
+qry <- if (isTRUE(test_mode)) {
+  sprintf("SELECT Symbol FROM ticker_master ORDER BY Symbol ASC LIMIT %d;", ticker_limit)
+} else {
+  "SELECT Symbol FROM ticker_master ORDER BY Symbol ASC;"
+}
+# Fetch tickers with robust reconnect-if-needed to avoid weak_ptr errors
+tickers <- tryCatch({
+  DBI::dbGetQuery(con, qry)
+}, error = function(e) {
+  message("Initial dbGetQuery failed (", conditionMessage(e), "). Reconnecting and retrying once.")
+  try(DBI::dbDisconnect(con), silent = TRUE)
+  con <<- DBI::dbConnect(
+    maria_drv,
+    host = mysql_host,
+    user = mysql_user,
+    password = mysql_password,
+    dbname = mysql_db
+  )
+  DBI::dbGetQuery(con, qry)
+})
+symbols <- tickers$Symbol
+
+if (isTRUE(test_mode)) {
+  message(sprintf("Running TEST MODE: start=%s, end=%s, tickers=%d", start_date, end_date, length(symbols)))
+}
+
+message(sprintf("Processing %d symbols: %s", length(symbols), paste(symbols, collapse = ", ")))
 
 # -----------------------------------------------------------------------------
 # Persist to MySQL: table Dissertation_Data
 # -----------------------------------------------------------------------------
-con <- dbConnect(MariaDB(), host = mysql_host, user = mysql_user, password = mysql_password, dbname = mysql_db)
-on.exit({ try(dbDisconnect(con), silent = TRUE) }, add = TRUE)
+
+# Re-establish connection if it timed out during API calls
+if (!DBI::dbIsValid(con)) {
+  try(DBI::dbDisconnect(con), silent = TRUE)
+  con <- DBI::dbConnect(
+    maria_drv,
+    host = mysql_host,
+    user = mysql_user,
+    password = mysql_password,
+    dbname = mysql_db
+  )
+}
 
 tbl_name <- "Dissertation_Data"
-new_rows_appended <- 0L
+new_rows_appended_total <- 0L
 
-if (!dbExistsTable(con, tbl_name)) {
-  message("Creating table Dissertation_Data ...")
-  dbWriteTable(con, tbl_name, master, overwrite = TRUE)
-  new_rows_appended <- nrow(master)
-} else {
-  # Ensure schema: drop legacy columns, ensure sharePrice exists
-  fields_now <- dbListFields(con, tbl_name)
-  if ("earningsReportDate" %in% fields_now) {
-    try(dbExecute(con, "ALTER TABLE `Dissertation_Data` DROP COLUMN `earningsReportDate`"), silent = TRUE)
-    fields_now <- setdiff(fields_now, "earningsReportDate")
-  }
-  for (col in c("earningsDate_3M", "earningsDate_6M", "earningsDate_12M")) {
-    if (col %in% fields_now) {
-      try(dbExecute(con, paste0("ALTER TABLE `Dissertation_Data` DROP COLUMN `", col, "`")), silent = TRUE)
-      fields_now <- setdiff(fields_now, col)
+# Helpers to coerce and sync schema to avoid 1406 errors
+
+# Heuristic: is a vector numeric-like?
+is_numeric_like <- function(x) {
+  if (inherits(x, "Date")) return(FALSE)
+  if (is.numeric(x)) return(TRUE)
+  if (!is.character(x)) return(FALSE)
+  y <- trimws(gsub(",", "", x, fixed = TRUE))
+  y[y %in% c("", "NA", "NaN", "null", "NULL")] <- NA_character_
+  suppressWarnings({
+    z <- as.numeric(y)
+  })
+  nz <- sum(!is.na(z))
+  if (length(y) == 0) return(FALSE)
+  ratio <- if (length(y) > 0) nz / length(y) else 0
+  nz > 0 && ratio >= 0.8
+}
+
+# Coerce numeric-like character columns to numeric (DOUBLE on DB side)
+coerce_numeric_like_cols <- function(df) {
+  keep_text <- function(nm) grepl("(?i)currency|industry|symbol|horizon|source|statement_type", nm)
+  for (nm in names(df)) {
+    col <- df[[nm]]
+    if (inherits(col, "Date") || keep_text(nm)) next
+    if (is_numeric_like(col)) {
+      suppressWarnings({ df[[nm]] <- as.numeric(gsub(",", "", as.character(col), fixed = TRUE)) })
     }
   }
-  if (!("sharePrice" %in% fields_now)) {
-    try(dbExecute(con, "ALTER TABLE `Dissertation_Data` ADD COLUMN `sharePrice` DOUBLE NULL"), silent = TRUE)
+  df
+}
+
+compute_field_types <- function(df) {
+  types <- list()
+  for (nm in names(df)) {
+    col <- df[[nm]]
+    if (inherits(col, "Date")) {
+      types[[nm]] <- "DATE"
+    } else if (is_numeric_like(col)) {
+      types[[nm]] <- "DOUBLE NULL"
+    } else {
+      # Default wide text to avoid length issues
+      types[[nm]] <- "TEXT NULL"
+    }
   }
-  try(dbExecute(con, "ALTER TABLE `Dissertation_Data` MODIFY COLUMN `sharePrice` DOUBLE NULL"), silent = TRUE)
+  types
+}
 
-  # Append-only for new rows, skip duplicates on (symbol, fiscalDateEnding)
-  existing <- tryCatch({
-    dbGetQuery(con, paste0("SELECT symbol, fiscalDateEnding FROM ", DBI::dbQuoteIdentifier(con, tbl_name)))
-  }, error = function(e) tibble(symbol = character(), fiscalDateEnding = as.Date(character())))
-
-  if (!"fiscalDateEnding" %in% names(existing)) {
-    existing$fiscalDateEnding <- as.Date(NA)
+sync_table_schema <- function(con, tbl, df) {
+  info <- tryCatch(DBI::dbGetQuery(con, paste0("SHOW COLUMNS FROM `", tbl, "`")), error = function(e) NULL)
+  if (is.null(info)) return(invisible())
+  existing <- if (nrow(info)) info$Field else character()
+  # Add missing columns
+  to_add <- setdiff(names(df), existing)
+  if (length(to_add)) {
+    ft <- compute_field_types(df[to_add])
+    for (nm in names(ft)) {
+      sql <- sprintf("ALTER TABLE `%s` ADD COLUMN `%s` %s", tbl, nm, ft[[nm]])
+      try(DBI::dbExecute(con, sql), silent = TRUE)
+    }
+    info <- tryCatch(DBI::dbGetQuery(con, paste0("SHOW COLUMNS FROM `", tbl, "`")), error = function(e) info)
   }
-  existing <- existing |>
-    mutate(fiscalDateEnding = suppressWarnings(as.Date(fiscalDateEnding))) |>
-    distinct()
-
-  # Ensure same columns for append: align to table fields
-  table_fields <- dbListFields(con, tbl_name)
-  to_insert <- master
-
-  # Drop columns not in table
-  to_insert <- to_insert[, intersect(names(to_insert), table_fields), drop = FALSE]
-
-  # Add any missing columns as NA to match table schema
-  missing_cols <- setdiff(table_fields, names(to_insert))
-  for (mc in missing_cols) to_insert[[mc]] <- NA
-  to_insert <- to_insert[, table_fields, drop = FALSE]
-
-  # Deduplicate against existing keys
-  if (nrow(existing)) {
-    to_insert <- to_insert |>
-      mutate(fiscalDateEnding = suppressWarnings(as.Date(fiscalDateEnding))) |>
-      anti_join(existing, by = c("symbol", "fiscalDateEnding"))
-  }
-
-  if (nrow(to_insert)) {
-    dbWriteTable(con, tbl_name, to_insert, append = TRUE)
-    new_rows_appended <- nrow(to_insert)
-  }
-  # Update existing rows with the new values for these columns via a joined update
-  updates <- master |>
-    select(any_of(c("symbol", "fiscalDateEnding", "sharePrice"))) |>
-    distinct()
-  if (nrow(updates)) {
-    tmp_name <- paste0("tmp_updates_", as.integer(Sys.time()))
-    dbWriteTable(con, tmp_name, updates, temporary = TRUE, overwrite = TRUE)
-    qry <- paste0(
-      "UPDATE `", tbl_name, "` d JOIN `", tmp_name, "` u",
-      " ON d.symbol = u.symbol AND d.fiscalDateEnding = u.fiscalDateEnding ",
-      "SET d.sharePrice = COALESCE(u.sharePrice, d.sharePrice)"
-    )
-    try(dbExecute(con, qry), silent = TRUE)
-    try(dbExecute(con, paste0("DROP TEMPORARY TABLE IF EXISTS `", tmp_name, "`")), silent = TRUE)
+  if (!nrow(info)) return(invisible())
+  # Widen or change type where needed
+  for (nm in intersect(names(df), info$Field)) {
+    desired <- if (inherits(df[[nm]], "Date")) "DATE" else if (is_numeric_like(df[[nm]])) "DOUBLE" else "TEXT"
+    t <- tolower(info$Type[info$Field == nm][1])
+    is_text <- grepl("text|char", t)
+    is_varchar <- grepl("varchar\\((\\d+)\\)", t)
+    is_numeric <- grepl("int|double|decimal|float|bigint", t)
+    is_date <- grepl("date", t)
+    if (identical(desired, "DATE") && !is_date) {
+      try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` DATE NULL", tbl, nm)), silent = TRUE)
+    } else if (identical(desired, "DOUBLE") && !is_numeric) {
+      try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` DOUBLE NULL", tbl, nm)), silent = TRUE)
+    } else if (identical(desired, "TEXT")) {
+      # Ensure at least VARCHAR(255); prefer TEXT for safety
+      if (!(grepl("text", t))) {
+        try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` TEXT NULL", tbl, nm)), silent = TRUE)
+      }
+    } else if (is_text && is_varchar) {
+      # Widen varchar(<255) to 255
+      m <- regexec("varchar\\((\\d+)\\)", t)
+      g <- regmatches(t, m)[[1]]
+      if (length(g) >= 2) {
+        n <- suppressWarnings(as.integer(g[2])); if (is.na(n) || n < 255) {
+          try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` VARCHAR(255) NULL", tbl, nm)), silent = TRUE)
+        }
+      }
+    }
   }
 }
 
-# -----------------------------------------------------------------------------
-# Summary (show most recent 3 quarters per symbol)
-# -----------------------------------------------------------------------------
-num_symbols <- length(unique(master$symbol))
+# BEGIN: Robust schema sync helpers (override previous definitions)
+get_indexed_columns <- function(con, tbl) {
+  idx <- tryCatch(DBI::dbGetQuery(con, paste0("SHOW INDEX FROM `", tbl, "`")), error = function(e) NULL)
+  if (is.null(idx) || !nrow(idx)) return(character())
+  unique(idx$Column_name)
+}
 
-# Compute count of newly appended rows by comparing current table vs before insert is tricky here.
-# Instead, report rows present for lookback period.
+compute_field_types <- function(df, con = NULL, tbl = NULL) {
+  indexed <- character()
+  if (!is.null(con) && !is.null(tbl)) {
+    indexed <- get_indexed_columns(con, tbl)
+  }
+  types <- list()
+  for (nm in names(df)) {
+    col <- df[[nm]]
+    if (inherits(col, "Date")) {
+      types[[nm]] <- "DATE"
+    } else if (is_numeric_like(col)) {
+      types[[nm]] <- "DOUBLE NULL"
+    } else {
+      # Use TEXT for free-form text; keep index columns (e.g., symbol) as VARCHAR(255)
+      if (nm %in% indexed || identical(nm, "symbol")) {
+        types[[nm]] <- "VARCHAR(255) NULL"
+      } else {
+        types[[nm]] <- "TEXT NULL"
+      }
+    }
+  }
+  types
+}
 
-final_preview <- master |>
-  select(any_of(c(
-    "symbol", "fiscalDateEnding", "sharePrice"
-  ))) |>
-  group_by(symbol) |>
-  arrange(desc(fiscalDateEnding), .by_group = TRUE) |>
-  slice_head(n = 3) |>
-  ungroup()
+sync_table_schema <- function(con, tbl, df) {
+  info <- tryCatch(DBI::dbGetQuery(con, paste0("SHOW COLUMNS FROM `", tbl, "`")), error = function(e) NULL)
+  if (is.null(info)) return(invisible())
+  existing <- if (nrow(info)) info$Field else character()
+  indexed <- get_indexed_columns(con, tbl)
+  # Add any new columns with wide-safe types immediately
+  to_add <- setdiff(names(df), existing)
+  if (length(to_add)) {
+    ft <- compute_field_types(df[to_add], con = con, tbl = tbl)
+    for (nm in names(ft)) {
+      sql <- sprintf("ALTER TABLE `%s` ADD COLUMN `%s` %s", tbl, nm, ft[[nm]])
+      try(DBI::dbExecute(con, sql), silent = TRUE)
+    }
+    info <- tryCatch(DBI::dbGetQuery(con, paste0("SHOW COLUMNS FROM `", tbl, "`")), error = function(e) info)
+  }
+  if (!nrow(info)) return(invisible())
+  # Enforce desired types: DATE, DOUBLE, TEXT/VARCHAR(255)
+  for (nm in intersect(names(df), info$Field)) {
+    col <- df[[nm]]
+    desired <- if (inherits(col, "Date")) {
+      "DATE"
+    } else if (is_numeric_like(col)) {
+      "DOUBLE"
+    } else if (nm %in% indexed || identical(nm, "symbol")) {
+      "VARCHAR"
+    } else {
+      "TEXT"
+    }
+
+    t <- tolower(info$Type[info$Field == nm][1])
+   is_varchar <- grepl("varchar\\((\\d+)\\)", t, perl = TRUE)
+    is_text <- grepl("text", t)
+    is_double <- grepl("double", t)
+    is_date <- grepl("date", t)
+
+    if (identical(desired, "DATE")) {
+      if (!is_date) {
+        try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` DATE NULL", tbl, nm)), silent = TRUE)
+      }
+      next
+    }
+
+    if (identical(desired, "DOUBLE")) {
+      # Always normalize numeric to DOUBLE NULL (covers INT/DECIMAL/etc.)
+      if (!is_double) {
+        try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` DOUBLE NULL", tbl, nm)), silent = TRUE)
+      }
+      next
+    }
+
+    if (identical(desired, "TEXT")) {
+      if (!is_text) {
+        ok <- TRUE
+        res <- try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` TEXT NULL", tbl, nm)), silent = TRUE)
+        if (inherits(res, "try-error")) ok <- FALSE
+        if (!ok) {
+          # Fallback if TEXT fails (e.g., indexed): ensure VARCHAR(255)
+          try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` VARCHAR(255) NULL", tbl, nm)), silent = TRUE)
+        }
+      }
+    } else if (identical(desired, "VARCHAR")) {
+      # Ensure at least VARCHAR(255)
+      widen <- TRUE
+      if (is_varchar) {
+        m <- regexec("varchar\\((\\d+)\\)", t, perl = TRUE)
+        g <- regmatches(t, m)[[1]]
+        if (length(g) >= 2) {
+          n <- suppressWarnings(as.integer(g[2]))
+          widen <- is.na(n) || n < 255
+        }
+      }
+      if (widen || !is_varchar) {
+        try(DBI::dbExecute(con, sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` VARCHAR(255) NULL", tbl, nm)), silent = TRUE)
+      }
+    }
+  }
+}
+# END: Robust schema sync helpers
+
+# Stream processing: handle one symbol at a time
+# Close the initial read connection (if still open) before per-ticker processing
+try(DBI::dbDisconnect(con), silent = TRUE)
+
+for (i in seq_along(symbols)) {
+  sym <- symbols[[i]]
+  message(sprintf("Processing %d of %d: %s ...", i, length(symbols), sym))
+
+  # Build data only for this symbol
+  sym_df <- make_symbol_frame(sym)
+
+  # Fresh DB connection for this ticker
+  con_sym <- DBI::dbConnect(
+    maria_drv,
+    host = mysql_host,
+    user = mysql_user,
+    password = mysql_password,
+    dbname = mysql_db
+  )
+
+  # Create table on first write if needed; otherwise sync and append
+  if (!DBI::dbExistsTable(con_sym, tbl_name)) {
+    message("Creating table Dissertation_Data ...")
+    sym_df <- coerce_numeric_like_cols(sym_df)
+    types <- compute_field_types(sym_df, con = con_sym, tbl = tbl_name)
+    DBI::dbWriteTable(con_sym, tbl_name, sym_df, overwrite = TRUE, field.types = types)
+    appended <- nrow(sym_df)
+  } else {
+    # Coerce numeric-like cols and sync schema
+    sym_df <- coerce_numeric_like_cols(sym_df)
+    sync_table_schema(con_sym, tbl_name, sym_df)
+
+    # Ensure schema fixes: drop legacy cols and ensure sharePrice DOUBLE
+    fields_now <- DBI::dbListFields(con_sym, tbl_name)
+    if ("earningsReportDate" %in% fields_now) {
+      try(DBI::dbExecute(con_sym, "ALTER TABLE `Dissertation_Data` DROP COLUMN `earningsReportDate`"), silent = TRUE)
+      fields_now <- setdiff(fields_now, "earningsReportDate")
+    }
+    for (col in c("earningsDate_3M", "earningsDate_6M", "earningsDate_12M")) {
+      if (col %in% fields_now) {
+        try(DBI::dbExecute(con_sym, paste0("ALTER TABLE `Dissertation_Data` DROP COLUMN `", col, "`")), silent = TRUE)
+        fields_now <- setdiff(fields_now, col)
+      }
+    }
+    if (!("sharePrice" %in% fields_now)) {
+      try(DBI::dbExecute(con_sym, "ALTER TABLE `Dissertation_Data` ADD COLUMN `sharePrice` DOUBLE NULL"), silent = TRUE)
+    }
+    try(DBI::dbExecute(con_sym, "ALTER TABLE `Dissertation_Data` MODIFY COLUMN `sharePrice` DOUBLE NULL"), silent = TRUE)
+
+    # Align to table schema and dedup vs existing for this symbol
+    table_fields <- DBI::dbListFields(con_sym, tbl_name)
+    to_insert <- sym_df[, intersect(names(sym_df), table_fields), drop = FALSE]
+    missing_cols <- setdiff(table_fields, names(to_insert))
+    for (mc in missing_cols) to_insert[[mc]] <- NA
+    to_insert <- to_insert[, table_fields, drop = FALSE]
+
+    existing <- tryCatch({
+      qsym <- DBI::dbQuoteString(con_sym, sym)
+      DBI::dbGetQuery(con_sym, sprintf("SELECT symbol, fiscalDateEnding FROM `%s` WHERE symbol = %s", tbl_name, as.character(qsym)))
+    }, error = function(e) tibble::tibble(symbol = character(), fiscalDateEnding = as.Date(character())))
+    if (!"fiscalDateEnding" %in% names(existing)) existing$fiscalDateEnding <- as.Date(NA)
+    existing <- dplyr::distinct(dplyr::mutate(existing, fiscalDateEnding = suppressWarnings(as.Date(fiscalDateEnding))))
+
+    if (nrow(existing)) {
+      to_insert <- to_insert |>
+        dplyr::mutate(fiscalDateEnding = suppressWarnings(as.Date(fiscalDateEnding))) |>
+        dplyr::anti_join(existing, by = c("symbol", "fiscalDateEnding"))
+    }
+
+    appended <- 0L
+    if (nrow(to_insert)) {
+      DBI::dbWriteTable(con_sym, tbl_name, to_insert, append = TRUE)
+      appended <- nrow(to_insert)
+    }
+
+    # Update sharePrice for existing rows for this symbol
+    updates <- sym_df |>
+      dplyr::select(dplyr::any_of(c("symbol", "fiscalDateEnding", "sharePrice"))) |>
+      dplyr::filter(symbol == sym) |>
+      dplyr::distinct()
+    if (nrow(updates)) {
+      tmp_name <- paste0("tmp_updates_", as.integer(Sys.time()), "_", gsub("[^A-Za-z0-9]", "", sym))
+      DBI::dbWriteTable(con_sym, tmp_name, updates, overwrite = TRUE)
+      qry <- paste0(
+        "UPDATE `", tbl_name, "` d JOIN `", tmp_name, "` u",
+        " ON d.symbol = u.symbol AND d.fiscalDateEnding = u.fiscalDateEnding ",
+        "SET d.sharePrice = COALESCE(u.sharePrice, d.sharePrice)"
+      )
+      try(DBI::dbExecute(con_sym, qry), silent = TRUE)
+      try(DBI::dbExecute(con_sym, paste0("DROP TABLE IF EXISTS `", tmp_name, "`")), silent = TRUE)
+    }
+  }
+
+  # Earnings calendar: write per symbol to its own table
+  ec_row <- try(get_earnings_calendar(sym), silent = TRUE)
+  if (!inherits(ec_row, "try-error") && !is.null(ec_row) && nrow(ec_row)) {
+    long_ec <- tibble::tibble(
+      symbol = sym,
+      horizon = c("3month", "6month", "12month"),
+      reportDate = as.Date(c(ec_row$earningsDate_3M[1], ec_row$earningsDate_6M[1], ec_row$earningsDate_12M[1])),
+      pull_date = Sys.Date(),
+      source = "AlphaVantage"
+    ) |>
+      dplyr::filter(!is.na(reportDate))
+    # Ensure table exists
+    try(DBI::dbExecute(con_sym, paste0(
+      "CREATE TABLE IF NOT EXISTS `Earnings_Calendar` (",
+      "`id` INT AUTO_INCREMENT PRIMARY KEY,",
+      "`symbol` VARCHAR(10),",
+      "`horizon` VARCHAR(10),",
+      "`reportDate` DATE,",
+      "`pull_date` DATE,",
+      "`source` VARCHAR(20))"
+    )), silent = TRUE)
+    # Replace rows for this symbol
+    qsym <- DBI::dbQuoteString(con_sym, sym)
+    try(DBI::dbExecute(con_sym, sprintf("DELETE FROM `Earnings_Calendar` WHERE symbol = %s", as.character(qsym))), silent = TRUE)
+    if (nrow(long_ec)) DBI::dbWriteTable(con_sym, "Earnings_Calendar", long_ec, append = TRUE)
+  }
+
+  new_rows_appended_total <- new_rows_appended_total + as.integer(appended)
+  message(sprintf("Appended %d new rows for %s", as.integer(appended), sym))
+
+  # Disconnect and cleanup before moving to the next ticker
+  try(DBI::dbDisconnect(con_sym), silent = TRUE)
+  if (exists(sym, envir = price_cache, inherits = FALSE)) {
+    try(rm(list = sym, envir = price_cache), silent = TRUE)
+  }
+  cleanup_resources()
+  Sys.sleep(api_sleep)
+}
 
 cat("\nSummary:\n")
-cat(sprintf("- Symbols processed: %d\n", num_symbols))
-cat(sprintf("- New rows appended: %s\n", format(new_rows_appended, big.mark = ",")))
+cat(sprintf("- Symbols processed: %d\n", length(symbols)))
+cat(sprintf("- New rows appended: %s\n", format(new_rows_appended_total, big.mark = ",")))
 
-# Try to count newly appended rows by re-querying table for recent window
+# Count rows in date range now present in the table
 recent_rows <- tryCatch({
-  qry <- paste0(
-    "SELECT COUNT(*) AS n FROM ", tbl_name,
-    " WHERE fiscalDateEnding >= DATE_SUB(CURDATE(), INTERVAL ", lookback_years, " YEAR)"
+  con_chk <- DBI::dbConnect(
+    maria_drv,
+    host = mysql_host,
+    user = mysql_user,
+    password = mysql_password,
+    dbname = mysql_db
   )
-  as.integer(dbGetQuery(con, qry)$n[1])
+  on.exit({ try(DBI::dbDisconnect(con_chk), silent = TRUE) }, add = TRUE)
+  s <- DBI::dbQuoteString(con_chk, as.character(as.Date(start_date)))
+  e <- DBI::dbQuoteString(con_chk, as.character(as.Date(end_date)))
+  qry <- sprintf(
+    "SELECT COUNT(*) AS n FROM `%s` WHERE fiscalDateEnding BETWEEN %s AND %s",
+    tbl_name, as.character(s), as.character(e)
+  )
+  as.integer(DBI::dbGetQuery(con_chk, qry)$n[1])
 }, error = function(e) NA_integer_)
 
 if (!is.na(recent_rows)) {
-  cat(sprintf("- Rows within lookback window now in table: %s\n", format(recent_rows, big.mark = ",")))
+  cat(sprintf("- Rows within date range now in table: %s\n", format(recent_rows, big.mark = ",")))
 }
 
-cat("- Preview (most recent 3 quarters per symbol):\n")
-print(final_preview, n = 10, width = Inf)
+## Earnings calendar is written per-ticker during streaming above
 
-# Load and persist forward earnings calendar to its own table
-ec <- load_earnings_calendar(symbols)
-# Ensure table exists regardless of whether we have rows now
-try(dbExecute(con, paste0(
-  "CREATE TABLE IF NOT EXISTS `Earnings_Calendar` (",
-  "`id` INT AUTO_INCREMENT PRIMARY KEY,",
-  "`symbol` VARCHAR(10),",
-  "`horizon` VARCHAR(10),",
-  "`reportDate` DATE,",
-  "`pull_date` DATE,",
-  "`source` VARCHAR(20))"
-)), silent = TRUE)
+# -----------------------------------------------------------------------------
+# Final: refresh derived fields via stored procedure
+# -----------------------------------------------------------------------------
+tryCatch({
+  ensure_db_valid()
+  DBI::dbExecute(con, "CALL sp_refresh_market_cap();")
+  message("✅ Market cap, year_qtr, and cap_category refreshed successfully.")
+}, error = function(e) {
+  message("⚠️ Stored procedure refresh failed: ", e$message)
+})
 
-if (nrow(ec)) {
-  # Replace older rows for same (symbol, horizon)
-  key_pairs <- ec |>
-    select(symbol, horizon) |>
-    distinct()
-  if (nrow(key_pairs)) {
-    invisible(apply(key_pairs, 1, function(row) {
-      sym <- row[["symbol"]]; hor <- row[["horizon"]]
-      try(dbExecute(con, sprintf(
-        "DELETE FROM `Earnings_Calendar` WHERE symbol = '%s' AND horizon = '%s'",
-        dbEscapeStrings(con, sym), dbEscapeStrings(con, hor)
-      )), silent = TRUE)
-    }))
+# -----------------------------------------------------------------------------
+# Backfill: load any tickers missing from Dissertation_Data (DISABLED)
+# -----------------------------------------------------------------------------
+# Temporarily disabled: main streaming loader handles inserts/dedup. Keeping code
+# in place for future gap detection work. Wrapped in if (FALSE) to prevent eval.
+if (FALSE) {
+missing_syms <- tryCatch({
+  s <- DBI::dbQuoteString(con, as.character(as.Date(start_date)))
+  e <- DBI::dbQuoteString(con, as.character(as.Date(end_date)))
+  sql <- paste0(
+    "SELECT tm.Symbol AS Symbol FROM `ticker_master` tm ",
+    "LEFT JOIN (",
+    "  SELECT DISTINCT symbol FROM `", tbl_name, "` ",
+    "  WHERE fiscalDateEnding BETWEEN ", as.character(s), " AND ", as.character(e),
+    ") d ON tm.Symbol = d.symbol ",
+    "WHERE d.symbol IS NULL ",
+    "ORDER BY tm.Symbol ASC"
+  )
+  df <- DBI::dbGetQuery(con, sql)
+  unique(df$Symbol)
+}, error = function(e) character())
+
+# Respect TEST_MODE and TICKER_LIMIT for backfill as well
+if (isTRUE(test_mode)) {
+  original_missing <- length(missing_syms)
+  if (original_missing > ticker_limit) {
+    missing_syms <- utils::head(missing_syms, ticker_limit)
   }
-  # Append new rows
-  dbWriteTable(con, "Earnings_Calendar", ec, append = TRUE)
+  message(sprintf(
+    "Backfill TEST MODE: limiting to %d of %d missing tickers",
+    length(missing_syms), original_missing
+  ))
 }
 
-# Verification output: earnings calendar dates
-if (nrow(ec)) {
-  cat("\nEarnings Calendar Verification:\n")
-  print(ec |> arrange(symbol, horizon) |> select(symbol, horizon, reportDate), n = nrow(ec), width = Inf)
-} else {
-  cat("\nEarnings Calendar Verification: no dates retrieved.\n")
+if (length(missing_syms)) {
+  message(sprintf(
+    "Backfill: %d tickers with no rows in date range %s to %s.",
+    length(missing_syms), as.character(as.Date(start_date)), as.character(as.Date(end_date))
+  ))
+  for (i in seq_along(missing_syms)) {
+    sym <- missing_syms[[i]]
+    message(sprintf("Backfill %d of %d: %s ...", i, length(missing_syms), sym))
+    # Build, write, and release this ticker immediately (no accumulation)
+    sym_df <- make_symbol_frame(sym)
+
+    con_sym <- DBI::dbConnect(
+      maria_drv,
+      host = mysql_host,
+      user = mysql_user,
+      password = mysql_password,
+      dbname = mysql_db
+    )
+
+    sym_df <- coerce_numeric_like_cols(sym_df)
+    sync_table_schema(con_sym, tbl_name, sym_df)
+    table_fields <- DBI::dbListFields(con_sym, tbl_name)
+    to_insert_bf <- sym_df[, intersect(names(sym_df), table_fields), drop = FALSE]
+    missing_cols <- setdiff(table_fields, names(to_insert_bf))
+    for (mc in missing_cols) to_insert_bf[[mc]] <- NA
+    to_insert_bf <- to_insert_bf[, table_fields, drop = FALSE]
+
+    existing_bf <- tryCatch({
+      qsym <- DBI::dbQuoteString(con_sym, sym)
+      DBI::dbGetQuery(con_sym, sprintf("SELECT symbol, fiscalDateEnding FROM `%s` WHERE symbol = %s", tbl_name, as.character(qsym)))
+    }, error = function(e) tibble::tibble(symbol = character(), fiscalDateEnding = as.Date(character())))
+    if (!"fiscalDateEnding" %in% names(existing_bf)) existing_bf$fiscalDateEnding <- as.Date(NA)
+    existing_bf <- dplyr::distinct(dplyr::mutate(existing_bf, fiscalDateEnding = suppressWarnings(as.Date(fiscalDateEnding))))
+    if (nrow(existing_bf)) {
+      to_insert_bf <- to_insert_bf |>
+        dplyr::mutate(fiscalDateEnding = suppressWarnings(as.Date(fiscalDateEnding))) |>
+        dplyr::anti_join(existing_bf, by = c("symbol", "fiscalDateEnding"))
+    }
+    if (nrow(to_insert_bf)) {
+      DBI::dbWriteTable(con_sym, tbl_name, to_insert_bf, append = TRUE)
+    }
+
+    # Earnings calendar for this symbol
+    ec_row <- try(get_earnings_calendar(sym), silent = TRUE)
+    if (!inherits(ec_row, "try-error") && !is.null(ec_row) && nrow(ec_row)) {
+      long_ec <- tibble::tibble(
+        symbol = sym,
+        horizon = c("3month", "6month", "12month"),
+        reportDate = as.Date(c(ec_row$earningsDate_3M[1], ec_row$earningsDate_6M[1], ec_row$earningsDate_12M[1])),
+        pull_date = Sys.Date(),
+        source = "AlphaVantage"
+      ) |>
+        dplyr::filter(!is.na(reportDate))
+      try(DBI::dbExecute(con_sym, paste0(
+        "CREATE TABLE IF NOT EXISTS `Earnings_Calendar` (",
+        "`id` INT AUTO_INCREMENT PRIMARY KEY,",
+        "`symbol` VARCHAR(10),",
+        "`horizon` VARCHAR(10),",
+        "`reportDate` DATE,",
+        "`pull_date` DATE,",
+        "`source` VARCHAR(20))"
+      )), silent = TRUE)
+      qsym <- DBI::dbQuoteString(con_sym, sym)
+      try(DBI::dbExecute(con_sym, sprintf("DELETE FROM `Earnings_Calendar` WHERE symbol = %s", as.character(qsym))), silent = TRUE)
+      if (nrow(long_ec)) DBI::dbWriteTable(con_sym, "Earnings_Calendar", long_ec, append = TRUE)
+    }
+
+    # Release resources before the next ticker
+    try(DBI::dbDisconnect(con_sym), silent = TRUE)
+    if (exists(sym, envir = price_cache, inherits = FALSE)) try(rm(list = sym, envir = price_cache), silent = TRUE)
+    cleanup_resources()
+    # Keep pacing the same
+    maybe_cleanup(i, every = 25)
+    Sys.sleep(api_sleep)
+  }
+  message("✅ Backfill complete")
 }
+} else {
+  message("Backfill disabled: skipping gap detection and insert step.")
+}
+
+# Optional: total row count confirmation (short-lived connection)
+con_chk <- DBI::dbConnect(
+  maria_drv,
+  host = mysql_host,
+  user = mysql_user,
+  password = mysql_password,
+  dbname = mysql_db
+)
+on.exit({ try(DBI::dbDisconnect(con_chk), silent = TRUE) }, add = TRUE)
+total <- tryCatch({
+  DBI::dbGetQuery(con_chk, sprintf("SELECT COUNT(*) AS n FROM `%s`", tbl_name))
+}, error = function(e) NULL)
+if (!is.null(total)) {
+  message(sprintf("✅ Total rows now in %s: %d", tbl_name, as.integer(total$n[1])))
+}
+
+# --- Final cleanup ---
+try({ closeAllConnections() }, silent = TRUE)
+if ("httr2" %in% loadedNamespaces()) try(httr2::req_perform_cancel_all(), silent = TRUE)
+invisible(gc(full = TRUE)); Sys.sleep(0.2); invisible(gc(full = TRUE))

@@ -78,11 +78,11 @@ main <- function() {
     "`status` VARCHAR(20))"
   )), silent = TRUE)
 
-  # Count rows loaded today (by pull_date)
+  # Count total rows (symbol-level, since symbol is PK in simplified schema)
   inserted <- 0L
   if (status == "SUCCESS") {
     try({
-      qry <- "SELECT COUNT(*) AS n FROM `Earnings_Calendar` WHERE pull_date = CURDATE()"
+      qry <- "SELECT COUNT(*) AS n FROM `Earnings_Calendar`"
       inserted <- as.integer(dbGetQuery(con, qry)$n[1])
     }, silent = TRUE)
   }
@@ -105,4 +105,3 @@ main <- function() {
 if (identical(environment(), globalenv())) {
   try(main(), silent = FALSE)
 }
-
